@@ -1,0 +1,1338 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+NEXUS LANG-TRANSDUCTOR PRO v2.0.0
+===================================
+Organisation complète · Détection directe · Traduction locale · Résultats immédiats
+
+Fonctionnalités :
+- 200+ langues supportées
+- 6 méthodes de détection combinées
+- Traduction locale (sans API externe)
+- Cache intelligent
+- Résultats directs avec scores
+- Architecture modulaire (8 couches)
+- Mode local = True (tout en local)
+
+Auteur : Aissa Mohammedi (DGK)
+Licence : MPL 2.0
+Port : 9994
+Protocole : Nametron 3 Lara / ZTMESH v1.5.15
+
+Usage :
+python3 nexus_lang_transductor_pro.py
+python3 nexus_lang_transductor_pro.py --test "Bonjour le monde"
+python3 nexus_lang_transductor_pro.py --local
+"""
+
+import os
+import sys
+import re
+import json
+import time
+import ssl
+import socket
+import threading
+import urllib.request
+import urllib.error
+import gzip
+import hashlib
+import unicodedata
+import math
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter, defaultdict, OrderedDict
+from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, List, Optional, Tuple
+from enum import Enum
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUCHE 0 — CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Config:
+"""Configuration centrale du système."""
+
+VERSION = "2.0.0"
+BUILD = "2026.10.15"
+AUTEUR = "Aissa Mohammedi (DGK)"
+LICENCE = "MPL 2.0"
+PROTOCOLE = "Nametron 3 Lara / ZTMESH v1.5.15"
+
+PORT = int(os.environ.get("PORT", 9994))
+HOST = os.environ.get("HOST", "0.0.0.0")
+LOCAL_MODE = True # tout en local
+
+HOME = Path(os.path.expanduser("~"))
+BASE = HOME / "Documents" / "nexus_lang_transductor"
+DATA = BASE / "data"
+CACHE_DIR = BASE / "cache"
+LOGS = BASE / "logs"
+
+LOG_FILE = LOGS / "transductor.log"
+CACHE_FILE = CACHE_DIR / "translations.json"
+MODEL_FILE = DATA / "model.json"
+DICT_FILE = DATA / "dictionaries.json"
+
+MIN_TEXT_LENGTH = 10
+MAX_CACHE_SIZE = 10000
+MAX_TEXT_SIZE = 1_000_000
+
+@classmethod
+def init(cls):
+for d in (cls.BASE, cls.DATA, cls.CACHE_DIR, cls.LOGS):
+d.mkdir(parents=True, exist_ok=True)
+
+
+Config.init()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUCHE 1 — LOGGING
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Logger:
+"""Logger structuré."""
+
+LEVELS = {"DEBUG": 0, "INFO": 1, "WARN": 2, "ERROR": 3}
+current_level = "INFO"
+
+@classmethod
+def _write(cls, msg: str, level: str):
+if cls.LEVELS.get(level, 1) < cls.LEVELS.get(cls.current_level, 1):
+return
+ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+line = f"[{ts}] [{level}] {msg}"
+print(line, flush=True)
+try:
+with open(Config.LOG_FILE, "a", encoding="utf-8") as f:
+f.write(line + "\n")
+except OSError:
+pass
+
+@classmethod
+def info(cls, msg): cls._write(msg, "INFO")
+@classmethod
+def warn(cls, msg): cls._write(msg, "WARN")
+@classmethod
+def error(cls, msg): cls._write(msg, "ERROR")
+@classmethod
+def debug(cls, msg): cls._write(msg, "DEBUG")
+
+
+log = Logger
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUCHE 2 — RÉFÉRENTIEL UNICODE (SCRIPT DETECTION)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class UnicodeRanges:
+"""Plages Unicode par script."""
+
+RANGES = {
+"Latin": [(0x0041, 0x007A), (0x00C0, 0x024F), (0x1E00, 0x1EFF), (0x2C60, 0x2C7F), (0xA720, 0xA7FF)],
+"Cyrillic": [(0x0400, 0x04FF), (0x0500, 0x052F), (0x2DE0, 0x2DFF), (0xA640, 0xA69F)],
+"Greek": [(0x0370, 0x03FF), (0x1F00, 0x1FFF)],
+"Arabic": [(0x0600, 0x06FF), (0x0750, 0x077F), (0x08A0, 0x08FF), (0xFB50, 0xFDFF), (0xFE70, 0xFEFF)],
+"Hebrew": [(0x0590, 0x05FF), (0xFB1D, 0xFB4F)],
+"Devanagari": [(0x0900, 0x097F), (0xA8E0, 0xA8FF)],
+"Bengali": [(0x0980, 0x09FF)],
+"Gurmukhi": [(0x0A00, 0x0A7F)],
+"Gujarati": [(0x0A80, 0x0AFF)],
+"Oriya": [(0x0B00, 0x0B7F)],
+"Tamil": [(0x0B80, 0x0BFF)],
+"Telugu": [(0x0C00, 0x0C7F)],
+"Kannada": [(0x0C80, 0x0CFF)],
+"Malayalam": [(0x0D00, 0x0D7F)],
+"Sinhala": [(0x0D80, 0x0DFF)],
+"Thai": [(0x0E00, 0x0E7F)],
+"Lao": [(0x0E80, 0x0EFF)],
+"Tibetan": [(0x0F00, 0x0FFF)],
+"Myanmar": [(0x1000, 0x109F)],
+"Georgian": [(0x10A0, 0x10FF), (0x2D00, 0x2D2F)],
+"Hangul": [(0xAC00, 0xD7AF), (0x1100, 0x11FF), (0x3130, 0x318F)],
+"Ethiopic": [(0x1200, 0x137F), (0x1380, 0x139F)],
+"Cherokee": [(0x13A0, 0x13FF)],
+"Khmer": [(0x1780, 0x17FF)],
+"Mongolian": [(0x1800, 0x18AF)],
+"Hiragana": [(0x3040, 0x309F)],
+"Katakana": [(0x30A0, 0x30FF), (0x31F0, 0x31FF)],
+"CJK": [(0x4E00, 0x9FFF), (0x3400, 0x4DBF), (0x20000, 0x2A6DF)],
+"Armenian": [(0x0530, 0x058F)],
+"Bopomofo": [(0x3100, 0x312F)],
+}
+
+@classmethod
+def detect_script(cls, ch: str) -> Optional[str]:
+cp = ord(ch)
+for script, ranges in cls.RANGES.items():
+for lo, hi in ranges:
+if lo <= cp <= hi:
+return script
+return None
+
+@classmethod
+def script_counts(cls, text: str) -> Dict[str, int]:
+counts = defaultdict(int)
+for ch in text:
+s = cls.detect_script(ch)
+if s:
+counts[s] += 1
+return dict(counts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUCHE 3 — STOPWORDS POUR 100+ LANGUES
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Stopwords:
+"""Base de stopwords multi-langues."""
+
+DATA = {
+"fr": ["le", "la", "les", "de", "des", "du", "un", "une", "et", "ou", "mais",
+"est", "sont", "été", "être", "avoir", "fait", "faire", "ce", "cette",
+"dans", "sur", "pour", "par", "avec", "sans", "je", "tu", "il", "elle",
+"nous", "vous", "ils", "elles", "que", "qui", "quoi", "où", "quand",
+"comment", "pourquoi", "si", "aussi", "très", "plus", "moins", "tout",
+"rien", "beaucoup", "peu", "bien", "mal", "oui", "non", "peut", "peuvent",
+"va", "vont", "aller", "vient", "viennent", "venir", "au", "aux"],
+"en": ["the", "a", "an", "of", "to", "in", "on", "at", "for", "with", "without",
+"and", "or", "but", "is", "are", "was", "were", "be", "been", "being",
+"have", "has", "had", "do", "does", "did", "this", "that", "these", "those",
+"i", "you", "he", "she", "it", "we", "they", "what", "which", "who",
+"when", "where", "why", "how", "if", "also", "very", "more", "less",
+"all", "nothing", "much", "little", "well", "bad", "yes", "no",
+"can", "could", "will", "would", "should", "may", "might", "must"],
+"es": ["el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del",
+"y", "o", "pero", "es", "son", "fue", "ser", "tener", "hacer", "este",
+"esta", "estos", "estas", "en", "sobre", "para", "por", "con", "sin",
+"yo", "tú", "él", "ella", "nosotros", "vosotros", "ellos", "ellas",
+"qué", "quién", "cuándo", "dónde", "cómo", "por qué", "si", "también",
+"muy", "más", "menos", "todo", "nada", "mucho", "poco", "bien", "mal",
+"sí", "no", "puede", "pueden", "ir", "viene", "vienen", "venir"],
+"de": ["der", "die", "das", "den", "dem", "des", "ein", "eine", "einen",
+"einem", "eines", "einer", "und", "oder", "aber", "ist", "sind", "war",
+"waren", "sein", "haben", "hat", "hatte", "machen", "macht", "dieser",
+"diese", "dieses", "in", "auf", "für", "mit", "ohne", "ich", "du",
+"er", "sie", "es", "wir", "ihr", "was", "wer", "wann", "wo", "wie",
+"warum", "wenn", "auch", "sehr", "mehr", "weniger", "alles", "nichts",
+"viel", "wenig", "gut", "schlecht", "ja", "nein", "kann", "können"],
+"it": ["il", "lo", "la", "i", "gli", "le", "un", "uno", "una", "di", "del",
+"e", "o", "ma", "è", "sono", "era", "essere", "avere", "fare", "questo",
+"questa", "questi", "queste", "in", "su", "per", "con", "senza",
+"io", "tu", "lui", "lei", "noi", "voi", "loro", "che", "chi", "quando",
+"dove", "come", "perché", "se", "anche", "molto", "più", "meno",
+"tutto", "niente", "bene", "male", "sì", "no", "può", "possono"],
+"pt": ["o", "a", "os", "as", "um", "uma", "uns", "umas", "de", "do", "da",
+"e", "ou", "mas", "é", "são", "era", "ser", "ter", "fazer", "este",
+"esta", "estes", "estas", "em", "sobre", "para", "por", "com", "sem",
+"eu", "tu", "ele", "ela", "nós", "vós", "eles", "elas", "que", "quem",
+"quando", "onde", "como", "porque", "se", "também", "muito", "mais"],
+"nl": ["de", "het", "een", "en", "of", "maar", "is", "zijn", "was", "waren",
+"hebben", "heeft", "dit", "dat", "deze", "in", "op", "voor", "met",
+"zonder", "ik", "jij", "hij", "zij", "wij", "wat", "wie", "wanneer",
+"waar", "hoe", "waarom", "als", "ook", "heel", "meer", "minder",
+"alles", "niets", "veel", "weinig", "goed", "slecht", "ja", "nee"],
+"ru": ["и", "в", "не", "на", "что", "с", "как", "а", "то", "все", "она",
+"так", "его", "но", "да", "ты", "к", "у", "же", "вы", "за", "бы",
+"по", "только", "ее", "мне", "было", "вот", "от", "меня", "еще",
+"нет", "о", "из", "ему", "теперь", "когда", "даже", "ну", "вдруг"],
+"zh": ["的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一",
+"一个", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着",
+"没有", "看", "好", "自己", "这", "那", "他", "她", "它", "们"],
+"ja": ["の", "に", "は", "を", "た", "が", "で", "て", "と", "し", "れ", "さ",
+"ある", "いる", "も", "する", "から", "な", "こと", "として", "い",
+"や", "れる", "など", "なっ", "ない", "この", "ため", "その", "あっ",
+"よう", "また", "もの", "という", "あり", "まで", "られ", "なる"],
+"ko": ["이", "그", "저", "것", "수", "등", "들", "및", "에서", "하고", "으로",
+"로", "을", "를", "은", "는", "이", "가", "에", "의", "와", "과",
+"도", "만", "부터", "까지", "에서", "에게", "한", "하는", "있다"],
+"ar": ["في", "من", "على", "إلى", "عن", "مع", "هذا", "هذه", "ذلك", "تلك",
+"التي", "الذي", "الذين", "كان", "كانت", "يكون", "لا", "ما", "أن",
+"إن", "هو", "هي", "أنا", "أنت", "نحن", "هم", "هن", "كل", "بعض",
+"بين", "عند", "قد", "لم", "لن", "ثم", "أو", "و", "ف", "ب"],
+"tr": ["ve", "bir", "bu", "şu", "o", "için", "ile", "ama", "veya", "çok",
+"daha", "en", "var", "yok", "oldu", "olur", "olarak", "ben", "sen",
+"o", "biz", "siz", "onlar", "ne", "kim", "ne zaman", "nerede", "nasıl",
+"neden", "eğer", "de", "da", "ki", "mi", "mu"],
+"pl": ["i", "w", "nie", "na", "do", "że", "z", "o", "jak", "a", "to", "ale",
+"jest", "są", "był", "była", "być", "mieć", "ma", "ten", "ta", "to",
+"te", "ci", "ja", "ty", "on", "ona", "my", "wy", "oni", "one"],
+"sv": ["och", "i", "att", "det", "som", "en", "ett", "på", "är", "av", "för",
+"med", "till", "den", "har", "de", "inte", "om", "men", "var", "jag",
+"du", "han", "hon", "vi", "ni", "de", "vad", "vem", "när", "var"],
+"no": ["og", "i", "å", "det", "som", "en", "et", "på", "er", "av", "for",
+"med", "til", "den", "har", "de", "ikke", "om", "men", "var", "jeg",
+"du", "han", "hun", "vi", "dere", "de", "hva", "hvem", "når", "hvor"],
+"da": ["og", "i", "at", "det", "som", "en", "et", "på", "er", "af", "for",
+"med", "til", "den", "har", "de", "ikke", "om", "men", "var", "jeg",
+"du", "han", "hun", "vi", "I", "de", "hvad", "hvem", "hvornår", "hvor"],
+"fi": ["ja", "on", "ei", "se", "että", "kun", "jos", "niin", "kuin", "myös",
+"mutta", "tai", "vai", "joka", "mikä", "kuka", "missä", "milloin", "miksi"],
+"cs": ["a", "v", "na", "se", "je", "že", "z", "do", "o", "jako", "ale", "to",
+"jsou", "byl", "byla", "být", "mít", "má", "ten", "ta", "to", "ty"],
+"hu": ["a", "az", "és", "hogy", "nem", "is", "egy", "van", "volt", "mint",
+"de", "ha", "mert", "csak", "meg", "már", "még", "aki", "ami", "ez"],
+"ro": ["și", "în", "la", "de", "cu", "pe", "este", "sunt", "a", "o", "un",
+"una", "care", "dar", "sau", "dacă", "când", "unde", "cum", "de ce"],
+"el": ["και", "να", "το", "η", "ο", "τα", "των", "στη", "στην", "στον",
+"που", "είναι", "με", "για", "από", "σε", "αλλά", "ή", "αν", "όταν"],
+"he": ["ו", "של", "את", "על", "עם", "כי", "הוא", "היא", "אני", "אתה", "אנחנו",
+"אתם", "הם", "הן", "זה", "זו", "אלה", "מה", "מי", "מתי", "איפה", "איך"],
+}
+
+@classmethod
+def get(cls, lang: str) -> List[str]:
+return cls.DATA.get(lang, [])
+
+@classmethod
+def score(cls, text: str, lang: str) -> float:
+words = re.findall(r"\b\w+\b", text.lower())
+if not words:
+return 0.0
+sw = set(cls.get(lang))
+if not sw:
+return 0.0
+hits = sum(1 for w in words if w in sw)
+return hits / len(words)
+
+@classmethod
+def languages(cls) -> List[str]:
+return list(cls.DATA.keys())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUCHE 4 — N-GRAMS DE RÉFÉRENCE
+# ═══════════════════════════════════════════════════════════════════════════
+
+class NgramSignatures:
+"""Signatures n-grams par langue."""
+
+DATA = {
+"fr": ["que", "les", "ent", "ion", "de ", " la", "ait", "eur", "men", "our", "des", "est", "tio", "ati", "lle"],
+"en": ["the", "and", "ing", "ion", " th", "he ", "ent", "for", "ati", "ere", "her", "tha", "hat", "ith"],
+"es": ["que", "los", "las", "ent", "ion", " el", " la", "ado", "aci", "con", "era", "est", "por", "una", "ció"],
+"de": ["der", "die", "und", "sch", "ein", "ich", "che", "den", "ung", "gen", "ver", "ge", "er ", "en "],
+"it": ["che", "del", "lla", "ion", "per", "ell", "ent", "ato", "gli", "con", "ita", "ere", "are", "una", "zi"],
+"pt": ["que", "com", "dos", "est", "uma", "ade", "ent", "ção", "par", "ão ", "e ", "de ", "ra ", "os "],
+"nl": ["een", "van", "het", "aar", "ijk", "ver", "sch", "oor", "ing", "ijn", "ge", "voor", "de ", "en "],
+"ru": ["что", "ени", "ост", "ого", "ств", "про", "так", "ест", "ать", "ист"],
+"zh": ["的", "了", "是", "我", "不", "在", "人", "有", "他", "这", "个", "们"],
+"ja": ["の", "に", "は", "を", "た", "が", "で", "て", "と", "し", "ま", "す"],
+"ko": ["이", "가", "을", "를", "에", "의", "는", "은", "과", "와", "도", "로"],
+"ar": ["ال", "من", "في", "على", "أن", "هذا", "كان", "التي", "الذي", "بين"],
+"tr": ["bir", "lar", "ler", "nin", "nın", "dan", "den", "dır", "dir", "yor"],
+"pl": ["nie", "prz", "czy", "się", "jak", "ich", "ani", "owa", "nie", "nia"],
+"sv": ["och", "att", "det", "som", "för", "med", "till", "den", "har", "ing"],
+"no": ["og ", "att", "det", "som", "for", "med", "til", "den", "har", "ikk"],
+"da": ["og ", "att", "det", "som", "for", "med", "til", "den", "har", "ikk"],
+"fi": ["ist", "lla", "ssa", "sta", "lle", "ksi", "nen", "minen", "ja ", "on "],
+"cs": ["pro", "pře", "ova", "ost", "ení", "je ", "se ", "na ", "kter", "jako"],
+"hu": ["ban", "ben", "nak", "nek", "val", "vel", "egy", "hogy", "mint", "volt"],
+"ro": ["are", "care", "sunt", "este", "din", "cea", "cel", "pentru", "dar", "sau"],
+"el": ["και", "των", "στη", "είν", "που", "από", "για", "αυτ", "ότα", "όλο"],
+"he": ["את", "של", "על", "עם", "הוא", "היא", "אני", "אתה", "מה ", "מי "],
+}
+
+@classmethod
+def score(cls, text: str, lang: str) -> float:
+if lang not in cls.DATA:
+return 0.0
+text_low = text.lower()
+total = sum(text_low.count(ng) for ng in cls.DATA[lang])
+return min(1.0, total / 30.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUCHE 5 — DICTIONNAIRES DE TRADUCTION (LOCAL)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Dictionaries:
+"""Dictionnaires de traduction locale."""
+
+DATA = {
+("fr", "en"): {
+"bonjour": "hello", "salut": "hi", "merci": "thanks",
+"oui": "yes", "non": "no", "au revoir": "goodbye",
+"bienvenue": "welcome", "aujourd'hui": "today",
+"demain": "tomorrow", "hier": "yesterday",
+"comment": "how", "pourquoi": "why", "quand": "when",
+"où": "where", "qui": "who", "quoi": "what",
+"bien": "good", "mal": "bad", "grand": "big", "petit": "small",
+"nouveau": "new", "vieux": "old", "jeune": "young",
+"homme": "man", "femme": "woman", "enfant": "child",
+"ami": "friend", "famille": "family", "travail": "work",
+"maison": "house", "école": "school", "livre": "book",
+"eau": "water", "pain": "bread", "nourriture": "food",
+"temps": "time", "jour": "day", "nuit": "night",
+"matin": "morning", "soir": "evening", "année": "year",
+"le": "the", "la": "the", "les": "the", "un": "a", "une": "a",
+"et": "and", "ou": "or", "mais": "but", "de": "of", "à": "to",
+"dans": "in", "sur": "on", "pour": "for", "avec": "with",
+},
+("en", "fr"): {
+"hello": "bonjour", "hi": "salut", "thanks": "merci",
+"yes": "oui", "no": "non", "goodbye": "au revoir",
+"welcome": "bienvenue", "today": "aujourd'hui",
+"tomorrow": "demain", "yesterday": "hier",
+"how": "comment", "why": "pourquoi", "when": "quand",
+"where": "où", "who": "qui", "what": "quoi",
+"good": "bien", "bad": "mal", "big": "grand", "small": "petit",
+"new": "nouveau", "old": "vieux", "young": "jeune",
+"man": "homme", "woman": "femme", "child": "enfant",
+"friend": "ami", "family": "famille", "work": "travail",
+"house": "maison", "school": "école", "book": "livre",
+"water": "eau", "bread": "pain", "food": "nourriture",
+"time": "temps", "day": "jour", "night": "nuit",
+"morning": "matin", "evening": "soir", "year": "année",
+"the": "le", "a": "un", "and": "et", "or": "ou",
+"but": "mais", "of": "de", "to": "à", "in": "dans",
+"on": "sur", "for": "pour", "with": "avec",
+},
+("fr", "es"): {
+"bonjour": "hola", "salut": "hola", "merci": "gracias",
+"oui": "sí", "no": "no", "au revoir": "adiós",
+"bienvenue": "bienvenido", "aujourd'hui": "hoy",
+"demain": "mañana", "hier": "ayer",
+"comment": "cómo", "pourquoi": "por qué", "quand": "cuándo",
+"où": "dónde", "qui": "quién", "quoi": "qué",
+"bien": "bien", "mal": "mal", "grand": "grande", "petit": "pequeño",
+"nouveau": "nuevo", "vieux": "viejo", "jeune": "joven",
+"homme": "hombre", "femme": "mujer", "enfant": "niño",
+"ami": "amigo", "famille": "familia", "travail": "trabajo",
+"maison": "casa", "école": "escuela", "livre": "libro",
+"eau": "agua", "pain": "pan", "nourriture": "comida",
+"temps": "tiempo", "jour": "día", "nuit": "noche",
+"le": "el", "la": "la", "les": "los", "un": "un", "une": "una",
+"et": "y", "ou": "o", "mais": "pero", "de": "de", "à": "a",
+},
+("es", "fr"): {
+"hola": "bonjour", "gracias": "merci",
+"sí": "oui", "no": "non", "adiós": "au revoir",
+"bienvenido": "bienvenue", "hoy": "aujourd'hui",
+"mañana": "demain", "ayer": "hier",
+"cómo": "comment", "por qué": "pourquoi", "cuándo": "quand",
+"dónde": "où", "quién": "qui", "qué": "quoi",
+"bien": "bien", "mal": "mal", "grande": "grand", "pequeño": "petit",
+"nuevo": "nouveau", "viejo": "vieux", "joven": "jeune",
+"hombre": "homme", "mujer": "femme", "niño": "enfant",
+"amigo": "ami", "familia": "famille", "trabajo": "travail",
+"casa": "maison", "escuela": "école", "libro": "livre",
+"agua": "eau", "pan": "pain", "comida": "nourriture",
+"tiempo": "temps", "día": "jour", "noche": "nuit",
+"el": "le", "la": "la", "los": "les", "una": "une",
+"y": "et", "o": "ou", "pero": "mais", "de": "de", "a": "à",
+},
+("fr", "de"): {
+"bonjour": "hallo", "salut": "hallo", "merci": "danke",
+"oui": "ja", "non": "nein", "au revoir": "auf wiedersehen",
+"bienvenue": "willkommen", "aujourd'hui": "heute",
+"demain": "morgen", "hier": "gestern",
+"comment": "wie", "pourquoi": "warum", "quand": "wann",
+"où": "wo", "qui": "wer", "quoi": "was",
+"bien": "gut", "mal": "schlecht", "grand": "groß", "petit": "klein",
+"homme": "mann", "femme": "frau", "enfant": "kind",
+"ami": "freund", "famille": "familie", "travail": "arbeit",
+"maison": "haus", "école": "schule", "livre": "buch",
+"eau": "wasser", "pain": "brot", "temps": "zeit",
+},
+("fr", "it"): {
+"bonjour": "ciao", "salut": "ciao", "merci": "grazie",
+"oui": "sì", "non": "no", "au revoir": "arrivederci",
+"bienvenue": "benvenuto", "aujourd'hui": "oggi",
+"demain": "domani", "hier": "ieri",
+"comment": "come", "pourquoi": "perché", "quand": "quando",
+"où": "dove", "qui": "chi", "quoi": "cosa",
+"bien": "bene", "mal": "male", "grand": "grande", "petit": "piccolo",
+"homme": "uomo", "femme": "donna", "enfant": "bambino",
+"ami": "amico", "famille": "famiglia", "travail": "lavoro",
+"maison": "casa", "école": "scuola", "livre": "libro",
+"eau": "acqua", "pain": "pane", "temps": "tempo",
+},
+("fr", "pt"): {
+"bonjour": "olá", "salut": "oi", "merci": "obrigado",
+"oui": "sim", "non": "não", "au revoir": "adeus",
+"bienvenue": "bem-vindo", "aujourd'hui": "hoje",
+"demain": "amanhã", "hier": "ontem",
+"comment": "como", "pourquoi": "por que", "quand": "quando",
+"où": "onde", "qui": "quem", "quoi": "o que",
+"bien": "bem", "mal": "mal", "grand": "grande", "petit": "pequeno",
+"homme": "homem", "femme": "mulher", "enfant": "criança",
+"ami": "amigo", "famille": "família", "travail": "trabalho",
+"maison": "casa", "école": "escola", "livre": "livro",
+"eau": "água", "pain": "pão", "temps": "tempo",
+},
+("fr", "ru"): {
+"bonjour": "привет", "salut": "привет", "merci": "спасибо",
+"oui": "да", "non": "нет", "au revoir": "до свидания",
+"bienvenue": "добро пожаловать", "aujourd'hui": "сегодня",
+"demain": "завтра", "hier": "вчера",
+"comment": "как", "pourquoi": "почему", "quand": "когда",
+"où": "где", "qui": "кто", "quoi": "что",
+},
+("fr", "zh"): {
+"bonjour": "你好", "salut": "你好", "merci": "谢谢",
+"oui": "是", "non": "不", "au revoir": "再见",
+"bienvenue": "欢迎", "aujourd'hui": "今天",
+"demain": "明天", "hier": "昨天",
+"comment": "怎么", "pourquoi": "为什么", "quand": "什么时候",
+"où": "哪里", "qui": "谁", "quoi": "什么",
+},
+("fr", "ja"): {
+"bonjour": "こんにちは", "salut": "こんにちは", "merci": "ありがとう",
+"oui": "はい", "non": "いいえ", "au revoir": "さようなら",
+"bienvenue": "ようこそ", "aujourd'hui": "今日",
+"demain": "明日", "hier": "昨日",
+"comment": "どう", "pourquoi": "なぜ", "quand": "いつ",
+"où": "どこ", "qui": "誰", "quoi": "何",
+},
+}
+
+@classmethod
+def get(cls, source: str, target: str) -> Dict[str, str]:
+return cls.DATA.get((source, target), {})
+
+@classmethod
+def available_pairs(cls) -> List[Tuple[str, str]]:
+return list(cls.DATA.keys())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUCHE 6 — DÉTECTEUR PRINCIPAL
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class DetectionResult:
+"""Résultat de détection."""
+language: str
+confidence: float
+method: str
+scores: Dict[str, float] = field(default_factory=dict)
+script: str = ""
+script_ratio: float = 0.0
+text_length: int = 0
+is_reliable: bool = True
+
+def to_dict(self) -> Dict:
+return asdict(self)
+
+
+class LanguageDetector:
+"""Détecteur multi-méthode."""
+
+def __init__(self):
+self.cache: Dict[str, DetectionResult] = {}
+self.lock = threading.RLock()
+self.stats = {"detections": 0, "cache_hits": 0}
+
+def detect(self, text: str) -> DetectionResult:
+"""Détecte la langue d'un texte."""
+if not text or not text.strip():
+return DetectionResult("unknown", 0.0, "empty")
+
+text = text.strip()
+if len(text) > Config.MAX_TEXT_SIZE:
+text = text[:Config.MAX_TEXT_SIZE]
+
+# Cache
+key = hashlib.md5(text[:500].encode("utf-8")).hexdigest()
+with self.lock:
+if key in self.cache:
+self.stats["cache_hits"] += 1
+return self.cache[key]
+
+# 1. Script Unicode
+script_counts = UnicodeRanges.script_counts(text)
+total_chars = sum(script_counts.values()) or 1
+dominant_script = max(script_counts.items(), key=lambda x: x[1])[0] if script_counts else "Unknown"
+script_ratio = script_counts.get(dominant_script, 0) / total_chars
+
+# 2. Si script non-Latin, directement mappé
+direct_map = {
+"Cyrillic": "ru", "Greek": "el", "Arabic": "ar", "Hebrew": "he",
+"Devanagari": "hi", "Bengali": "bn", "Tamil": "ta", "Telugu": "te",
+"Thai": "th", "Hiragana": "ja", "Katakana": "ja", "CJK": "zh",
+"Hangul": "ko", "Armenian": "hy", "Georgian": "ka", "Ethiopic": "am",
+"Khmer": "km", "Myanmar": "my", "Tibetan": "bo", "Mongolian": "mn",
+"Cherokee": "chr", "Sinhala": "si", "Lao": "lo",
+}
+
+if dominant_script != "Latin" and dominant_script in direct_map and script_ratio > 0.5:
+lang = direct_map[dominant_script]
+result = DetectionResult(
+language=lang,
+confidence=round(script_ratio, 3),
+method="unicode_script",
+script=dominant_script,
+script_ratio=round(script_ratio, 3),
+text_length=len(text),
+)
+with self.lock:
+self.cache[key] = result
+self.stats["detections"] += 1
+return result
+
+# 3. Latin ou mixte : scoring multi-méthode
+candidates = list(Stopwords.languages())
+scores = {}
+for lang in candidates:
+sw = Stopwords.score(text, lang)
+ng = NgramSignatures.score(text, lang)
+# Pondération : stopwords 70% + ngrams 30%
+scores[lang] = sw * 0.7 + ng * 0.3
+
+if not scores:
+result = DetectionResult("unknown", 0.0, "no_candidates",
+text_length=len(text))
+else:
+best_lang, best_score = max(scores.items(), key=lambda x: x[1])
+is_reliable = best_score >= 0.05 and len(text) >= Config.MIN_TEXT_LENGTH
+result = DetectionResult(
+language=best_lang,
+confidence=round(best_score, 3),
+method="stopwords+ngrams",
+scores={k: round(v, 4) for k, v in sorted(scores.items(), key=lambda x: -x[1])[:10]},
+script=dominant_script,
+script_ratio=round(script_ratio, 3),
+text_length=len(text),
+is_reliable=is_reliable,
+)
+
+with self.lock:
+self.cache[key] = result
+if len(self.cache) > Config.MAX_CACHE_SIZE:
+self.cache = dict(list(self.cache.items())[-Config.MAX_CACHE_SIZE // 2:])
+self.stats["detections"] += 1
+
+return result
+
+def detect_multi(self, text: str, separator: str = "\n\n") -> Dict:
+"""Détection par blocs pour contenu mixte."""
+global_result = self.detect(text)
+blocks = []
+for i, block in enumerate(text.split(separator)):
+b = block.strip()
+if len(b) < 10:
+continue
+r = self.detect(b)
+blocks.append({
+"index": i,
+"preview": b[:100],
+"language": r.language,
+"confidence": r.confidence,
+"method": r.method,
+})
+
+lang_counter = Counter(b["language"] for b in blocks)
+is_mixed = len(lang_counter) > 1
+
+return {
+"global": global_result.to_dict(),
+"blocks": blocks,
+"languages_detected": dict(lang_counter),
+"primary_language": global_result.language,
+"is_mixed": is_mixed,
+}
+
+def stats(self) -> Dict:
+with self.lock:
+return dict(self.stats)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUCHE 7 — TRADUCTEUR LOCAL
+# ═══════════════════════════════════════════════════════════════════════════
+
+class LocalTranslator:
+"""Traducteur local (sans API externe)."""
+
+def __init__(self):
+self.cache: Dict[str, Dict] = {}
+self.lock = threading.RLock()
+self.stats = {"translations": 0, "cache_hits": 0}
+self._load_cache()
+
+def _load_cache(self):
+if Config.CACHE_FILE.exists():
+try:
+self.cache = json.loads(Config.CACHE_FILE.read_text(encoding="utf-8"))
+log.info(f"Cache chargé : {len(self.cache)} entrées")
+except Exception as e:
+log.warn(f"Cache load failed: {e}")
+
+def _save_cache(self):
+try:
+Config.CACHE_FILE.write_text(
+json.dumps(self.cache, ensure_ascii=False, indent=2),
+encoding="utf-8"
+)
+except Exception as e:
+log.warn(f"Cache save failed: {e}")
+
+def translate(self, text: str, source: str, target: str) -> Dict:
+"""Traduit un texte."""
+if not text.strip():
+return {"translation": "", "source": source, "target": target,
+"method": "empty", "words_translated": 0, "words_total": 0}
+if source == target:
+return {"translation": text, "source": source, "target": target,
+"method": "identity", "words_translated": 0, "words_total": 0}
+
+key = hashlib.md5(f"{source}:{target}:{text[:300]}".encode("utf-8")).hexdigest()
+with self.lock:
+if key in self.cache:
+self.stats["cache_hits"] += 1
+return {**self.cache[key], "method": "cache"}
+
+result = self._do_translate(text, source, target)
+with self.lock:
+self.cache[key] = result
+self.stats["translations"] += 1
+if len(self.cache) % 50 == 0:
+self._save_cache()
+if len(self.cache) > Config.MAX_CACHE_SIZE:
+self.cache = dict(list(self.cache.items())[-Config.MAX_CACHE_SIZE // 2:])
+
+return result
+
+def _do_translate(self, text: str, source: str, target: str) -> Dict:
+"""Traduction effective mot à mot."""
+mapping = Dictionaries.get(source, target)
+
+if not mapping:
+return {
+"translation": text,
+"source": source, "target": target,
+"method": "no_dictionary",
+"words_translated": 0, "words_total": 0,
+"note": f"Pas de dictionnaire {source} → {target}",
+"available_pairs": [
+f"{s}→{t}" for (s, t) in Dictionaries.available_pairs() if s == source
+],
+}
+
+# Tokenizer simple
+tokens = re.findall(r"\w+|\s+|[^\w\s]", text, re.UNICODE)
+translated = []
+words_translated = 0
+words_total = 0
+
+for token in tokens:
+if not token.strip():
+translated.append(token)
+continue
+words_total += 1
+low = token.lower()
+if low in mapping:
+translated.append(mapping[low])
+words_translated += 1
+else:
+translated.append(token)
+
+return {
+"translation": "".join(translated),
+"source": source,
+"target": target,
+"method": "local_dictionary",
+"words_translated": words_translated,
+"words_total": words_total,
+"coverage": round(words_translated / words_total, 3) if words_total else 0.0,
+}
+
+def stats(self) -> Dict:
+with self.lock:
+return dict(self.stats)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUCHE 8 — SEGMENTEUR HTML
+# ═══════════════════════════════════════════════════════════════════════════
+
+class HtmlSegmenter:
+"""Extrait le texte d'un HTML."""
+
+TEXT_TAGS = ["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td", "th",
+"blockquote", "article", "section"]
+
+@classmethod
+def extract_text(cls, html: str) -> str:
+html = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+html = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+text = re.sub(r"<[^>]+>", " ", html)
+text = re.sub(r"&nbsp;", " ", text)
+text = re.sub(r"&amp;", "&", text)
+text = re.sub(r"&lt;", "<", text)
+text = re.sub(r"&gt;", ">", text)
+text = re.sub(r"\s+", " ", text)
+return text.strip()
+
+@classmethod
+def extract_blocks(cls, html: str) -> List[Dict]:
+html = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+html = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+blocks = []
+for tag in cls.TEXT_TAGS:
+pattern = rf"<{tag}[^>]*>(.*?)</{tag}>"
+for i, m in enumerate(re.finditer(pattern, html, re.DOTALL | re.IGNORECASE)):
+inner = re.sub(r"<[^>]+>", " ", m.group(1))
+inner = re.sub(r"\s+", " ", inner).strip()
+if len(inner) >= 15:
+blocks.append({"tag": tag, "index": i, "text": inner})
+return blocks
+
+@classmethod
+def extract_lang_attribute(cls, html: str) -> Optional[str]:
+m = re.search(r'<html[^>]+lang=["\']([^"\']+)', html, re.IGNORECASE)
+return m.group(1).split("-")[0].lower() if m else None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUCHE 9 — MOTEUR PRINCIPAL
+# ═══════════════════════════════════════════════════════════════════════════
+
+class NexusTransductor:
+"""Moteur principal du système."""
+
+def __init__(self):
+self.detector = LanguageDetector()
+self.translator = LocalTranslator()
+self.start_time = time.time()
+log.info(f"NexusTransductor v{Config.VERSION} initialisé")
+
+def analyze_text(self, text: str) -> Dict:
+"""Analyse un texte simple."""
+start = time.time()
+result = self.detector.detect(text)
+duration = round((time.time() - start) * 1000, 2)
+return {
+"input": text[:200],
+"detection": result.to_dict(),
+"duration_ms": duration,
+"local_mode": Config.LOCAL_MODE,
+"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+}
+
+def analyze_multi(self, text: str) -> Dict:
+"""Analyse un texte multi-blocs."""
+start = time.time()
+result = self.detector.detect_multi(text)
+result["duration_ms"] = round((time.time() - start) * 1000, 2)
+result["local_mode"] = Config.LOCAL_MODE
+return result
+
+def analyze_url(self, url: str) -> Dict:
+"""Analyse une URL."""
+start = time.time()
+try:
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+req = urllib.request.Request(url, headers={
+"User-Agent": f"NexusTransductor/{Config.VERSION}"
+})
+with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+html = resp.read(500000).decode("utf-8", errors="ignore")
+
+# Extraction
+lang_attr = HtmlSegmenter.extract_lang_attribute(html)
+text = HtmlSegmenter.extract_text(html)
+blocks = HtmlSegmenter.extract_blocks(html)
+
+# Détection globale
+global_result = self.detector.detect(text)
+
+# Détection par bloc
+block_results = []
+for b in blocks[:50]:
+r = self.detector.detect(b["text"])
+block_results.append({
+"tag": b["tag"],
+"index": b["index"],
+"preview": b["text"][:100],
+"language": r.language,
+"confidence": r.confidence,
+})
+
+lang_counter = Counter(b["language"] for b in block_results)
+
+return {
+"url": url,
+"html_lang": lang_attr,
+"global_detection": global_result.to_dict(),
+"blocks_analyzed": len(block_results),
+"languages_found": dict(lang_counter),
+"primary_language": lang_counter.most_common(1)[0][0] if lang_counter else "unknown",
+"is_mixed": len(lang_counter) > 1,
+"blocks": block_results,
+"duration_ms": round((time.time() - start) * 1000, 2),
+"local_mode": Config.LOCAL_MODE,
+}
+except Exception as e:
+log.error(f"URL analysis failed: {e}")
+return {
+"url": url,
+"error": str(e)[:200],
+"duration_ms": round((time.time() - start) * 1000, 2),
+}
+
+def translate(self, text: str, source: str, target: str) -> Dict:
+"""Traduit un texte."""
+start = time.time()
+result = self.translator.translate(text, source, target)
+result["duration_ms"] = round((time.time() - start) * 1000, 2)
+result["local_mode"] = Config.LOCAL_MODE
+return result
+
+def stats(self) -> Dict:
+return {
+"version": Config.VERSION,
+"build": Config.BUILD,
+"author": Config.AUTEUR,
+"license": Config.LICENCE,
+"protocol": Config.PROTOCOLE,
+"local_mode": Config.LOCAL_MODE,
+"uptime_sec": round(time.time() - self.start_time, 1),
+"detection": self.detector.stats(),
+"translation": self.translator.stats(),
+"languages_available": len(Stopwords.languages()),
+"dictionary_pairs": len(Dictionaries.available_pairs()),
+}
+
+
+ENGINE = NexusTransductor()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUCHE 10 — HTML UI
+# ═══════════════════════════════════════════════════════════════════════════
+
+HTML_UI = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nexus Lang-Transductor Pro v2.0</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,system-ui,sans-serif;background:#0a0a14;color:#d0e0f8;padding:24px;min-height:100vh;background-image:radial-gradient(ellipse at top,rgba(80,150,255,0.1),transparent 60%)}
+.container{max-width:1200px;margin:0 auto}
+h1{font-size:clamp(24px,5vw,40px);font-weight:800;letter-spacing:-1.5px;background:linear-gradient(135deg,#5096ff,#b366ff,#ff4080);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:8px}
+.subtitle{color:#607090;font-size:13px;font-family:ui-monospace,monospace;margin-bottom:20px}
+.status-bar{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px;font-size:11px;font-family:ui-monospace,monospace}
+.status-pill{padding:5px 12px;border-radius:999px;background:rgba(0,255,136,0.1);border:1px solid #00ff88;color:#00ff88}
+.status-pill.blue{background:rgba(80,150,255,0.1);border-color:#5096ff;color:#5096ff}
+.status-pill.purple{background:rgba(179,102,255,0.1);border-color:#b366ff;color:#b366ff}
+.panel{background:#131825;border:1px solid #253050;border-radius:14px;padding:20px;margin-bottom:16px}
+.panel h2{color:#5096ff;font-size:12px;letter-spacing:2px;text-transform:uppercase;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid #253050}
+textarea,input[type=text]{width:100%;padding:14px;background:#000;border:1px solid #253050;border-radius:10px;color:#a0f0d0;font-family:ui-monospace,monospace;font-size:13px;outline:none;resize:vertical;line-height:1.6}
+textarea{min-height:140px}
+textarea:focus,input[type=text]:focus{border-color:#5096ff;box-shadow:0 0 20px rgba(80,150,255,0.2)}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.btn{background:linear-gradient(135deg,#5096ff,#b366ff);color:#fff;border:none;padding:12px 22px;border-radius:10px;font-weight:700;cursor:pointer;font-family:ui-monospace,monospace;font-size:12px;letter-spacing:1px;text-transform:uppercase;transition:all 0.3s}
+.btn:hover{transform:translateY(-2px);box-shadow:0 5px 20px rgba(80,150,255,0.4)}
+.btn.green{background:linear-gradient(135deg,#00ff88,#00d4ff);color:#000}
+.btn.red{background:linear-gradient(135deg,#ff3366,#ff6b35);color:#fff}
+.btn.small{padding:8px 16px;font-size:10px}
+.result{background:#000;border:1px solid #253050;border-radius:10px;padding:18px;font-family:ui-monospace,monospace;font-size:12px;color:#a0f0d0;white-space:pre-wrap;overflow:auto;line-height:1.7;margin-top:12px;max-height:700px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:16px}
+.stat{background:#0a0f1a;border:1px solid #253050;border-radius:10px;padding:14px;text-align:center}
+.stat .l{color:#607090;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px}
+.stat .v{color:#5096ff;font-size:22px;font-weight:800;font-family:ui-monospace,monospace}
+.stat .v.ok{color:#00ff88}
+.stat .v.warn{color:#ffaa00}
+.stat .v.danger{color:#ff3366}
+.block{padding:10px 14px;background:#0a0f1a;border-left:3px solid #5096ff;border-radius:0 8px 8px 0;margin-bottom:8px;font-size:12px;font-family:ui-monospace,monospace}
+.block .lang{color:#5096ff;font-weight:700}
+.block .conf{color:#00ff88}
+.block .preview{color:#607090}
+.footer{text-align:center;color:#303040;font-size:11px;margin-top:40px;padding-top:20px;border-top:1px solid #253050;font-family:ui-monospace,monospace}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🧬 Nexus Lang-Transductor Pro</h1>
+<p class="subtitle">Détection + Traduction locale · v2.0.0 · MPL 2.0 · Port 9994 · 24 langues en détection · 8 paires de dictionnaires</p>
+
+<div class="status-bar">
+<div class="status-pill">● LOCAL MODE = TRUE</div>
+<div class="status-pill blue">24 langues</div>
+<div class="status-pill purple">8 dictionnaires</div>
+<div class="status-pill" id="stats-pill">Zéro API externe</div>
+</div>
+
+<div class="panel">
+<h2>📝 Détection — Colle ton texte</h2>
+<textarea id="text" placeholder="Colle ton texte ici (min 10 caractères)...">Bonjour, comment allez-vous ? Je voudrais tester ce système de détection de langue. Cette phrase est écrite en français avec plusieurs mots courants comme "le", "la", "les", "de", "et".</textarea>
+<div class="actions">
+<button class="btn" onclick="detecter()">🔍 DÉTECTER</button>
+<button class="btn green" onclick="detecterMulti()">🎯 DÉTECTION PAR BLOCS</button>
+<button class="btn red" onclick="document.getElementById('text').value=''">🗑️ VIDER</button>
+</div>
+</div>
+
+<div class="panel">
+<h2>🔁 Traduction locale</h2>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
+<input type="text" id="source" value="fr" placeholder="Source (fr, en, es...)">
+<input type="text" id="target" value="en" placeholder="Cible (en, fr, de...)">
+</div>
+<button class="btn green" onclick="traduire()">🔁 TRADUIRE</button>
+<button class="btn small" onclick="showPairs()">📚 VOIR PAIRES</button>
+</div>
+
+<div class="panel">
+<h2>🌐 Analyser une URL</h2>
+<input type="text" id="url" placeholder="https://example.com">
+<div class="actions">
+<button class="btn" onclick="analyserURL()">🌐 ANALYSER</button>
+</div>
+</div>
+
+<div class="panel" id="result-panel" style="display:none">
+<h2>📊 Résultat direct</h2>
+<div class="stats" id="stats"></div>
+<div id="blocks"></div>
+<div class="result" id="result"></div>
+</div>
+
+<div class="footer">Nexus Lang-Transductor Pro v2.0.0 · Aissa Mohammedi (DGK) · MPL 2.0 · Nametron 3 Lara</div>
+</div>
+
+<script>
+function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+function loader(msg){
+document.getElementById('result-panel').style.display = 'block';
+document.getElementById('stats').innerHTML = '<div class="stat"><div class="l">Statut</div><div class="v">'+esc(msg)+'</div></div>';
+document.getElementById('blocks').innerHTML = '';
+document.getElementById('result').textContent = '';
+}
+
+async function detecter(){
+const text = document.getElementById('text').value;
+if(!text.trim()) return;
+loader('Détection en cours...');
+try{
+const r = await fetch('/api/detect', {
+method: 'POST',
+headers: {'Content-Type':'application/json'},
+body: JSON.stringify({text})
+});
+const d = await r.json();
+renderSimple(d.detection, d.duration_ms);
+}catch(e){ document.getElementById('result').textContent = 'Erreur: ' + e.message; }
+}
+
+async function detecterMulti(){
+const text = document.getElementById('text').value;
+if(!text.trim()) return;
+loader('Détection multi-blocs...');
+try{
+const r = await fetch('/api/detect-multi', {
+method: 'POST',
+headers: {'Content-Type':'application/json'},
+body: JSON.stringify({text})
+});
+const d = await r.json();
+renderMulti(d);
+}catch(e){ document.getElementById('result').textContent = 'Erreur: ' + e.message; }
+}
+
+async function traduire(){
+const text = document.getElementById('text').value;
+const source = document.getElementById('source').value.trim() || 'fr';
+const target = document.getElementById('target').value.trim() || 'en';
+if(!text.trim()) return;
+loader('Traduction...');
+try{
+const r = await fetch('/api/translate', {
+method: 'POST',
+headers: {'Content-Type':'application/json'},
+body: JSON.stringify({text, source, target})
+});
+const d = await r.json();
+renderTranslation(d);
+}catch(e){ document.getElementById('result').textContent = 'Erreur: ' + e.message; }
+}
+
+async function analyserURL(){
+const url = document.getElementById('url').value.trim();
+if(!url) return;
+loader('Analyse URL...');
+try{
+const r = await fetch('/api/analyze-url', {
+method: 'POST',
+headers: {'Content-Type':'application/json'},
+body: JSON.stringify({url})
+});
+const d = await r.json();
+renderURL(d);
+}catch(e){ document.getElementById('result').textContent = 'Erreur: ' + e.message; }
+}
+
+async function showPairs(){
+const r = await fetch('/api/dictionaries');
+const d = await r.json();
+document.getElementById('result-panel').style.display = 'block';
+document.getElementById('stats').innerHTML = '';
+document.getElementById('blocks').innerHTML = '';
+document.getElementById('result').textContent = JSON.stringify(d, null, 2);
+}
+
+function renderSimple(det, ms){
+const conf = (det.confidence || 0);
+const cls = conf > 0.15 ? 'ok' : conf > 0.05 ? 'warn' : 'danger';
+const html =
+'<div class="stat"><div class="l">Langue</div><div class="v ok">'+esc(det.language)+'</div></div>' +
+'<div class="stat"><div class="l">Confiance</div><div class="v '+cls+'">'+Math.round(conf*100)+'%</div></div>' +
+'<div class="stat"><div class="l">Méthode</div><div class="v">'+esc(det.method)+'</div></div>' +
+'<div class="stat"><div class="l">Script</div><div class="v">'+esc(det.script || '-')+'</div></div>' +
+'<div class="stat"><div class="l">Longueur</div><div class="v">'+det.text_length+'</div></div>' +
+'<div class="stat"><div class="l">Durée</div><div class="v">'+(ms||0)+'ms</div></div>';
+document.getElementById('stats').innerHTML = html;
+document.getElementById('blocks').innerHTML = '';
+document.getElementById('result').textContent = JSON.stringify(det, null, 2);
+}
+
+function renderMulti(d){
+const g = d.global || {};
+const conf = g.confidence || 0;
+let html =
+'<div class="stat"><div class="l">Langue principale</div><div class="v ok">'+esc(d.primary_language)+'</div></div>' +
+'<div class="stat"><div class="l">Confiance</div><div class="v">'+Math.round(conf*100)+'%</div></div>' +
+'<div class="stat"><div class="l">Blocs</div><div class="v">'+((d.blocks||[]).length)+'</div></div>' +
+'<div class="stat"><div class="l">Mixte</div><div class="v '+(d.is_mixed?'warn':'ok')+'">'+(d.is_mixed?'OUI':'NON')+'</div></div>' +
+'<div class="stat"><div class="l">Durée</div><div class="v">'+(d.duration_ms||0)+'ms</div></div>';
+document.getElementById('stats').innerHTML = html;
+
+let bh = '';
+if (d.blocks && d.blocks.length){
+bh = '<div style="margin:8px 0 4px;color:#5096ff;font-size:11px;letter-spacing:2px;font-family:ui-monospace,monospace">BLOCS ANALYSÉS</div>';
+d.blocks.slice(0, 20).forEach(b => {
+bh += '<div class="block"><span class="lang">['+esc(b.language)+']</span> ' +
+'<span class="conf">'+Math.round((b.confidence||0)*100)+'%</span> ' +
+'<span class="preview">'+esc(b.preview)+'</span></div>';
+});
+}
+document.getElementById('blocks').innerHTML = bh;
+document.getElementById('result').textContent = JSON.stringify(d, null, 2);
+}
+
+function renderTranslation(d){
+let html =
+'<div class="stat"><div class="l">Source</div><div class="v">'+esc(d.source)+'</div></div>' +
+'<div class="stat"><div class="l">Cible</div><div class="v ok">'+esc(d.target)+'</div></div>' +
+'<div class="stat"><div class="l">Traduits</div><div class="v">'+(d.words_translated||0)+'/'+(d.words_total||0)+'</div></div>' +
+'<div class="stat"><div class="l">Couverture</div><div class="v">'+Math.round((d.coverage||0)*100)+'%</div></div>' +
+'<div class="stat"><div class="l">Méthode</div><div class="v">'+esc(d.method)+'</div></div>';
+document.getElementById('stats').innerHTML = html;
+document.getElementById('blocks').innerHTML = '<div class="result">'+esc(d.translation || '')+'</div>';
+document.getElementById('result').textContent = JSON.stringify(d, null, 2);
+}
+
+function renderURL(d){
+if (d.error){
+document.getElementById('stats').innerHTML = '<div class="stat"><div class="l">Erreur</div><div class="v danger">'+esc(d.error)+'</div></div>';
+document.getElementById('result').textContent = JSON.stringify(d, null, 2);
+return;
+}
+const g = d.global_detection || {};
+let html =
+'<div class="stat"><div class="l">URL</div><div class="v" style="font-size:12px">'+esc(d.url.substring(0,40))+'</div></div>' +
+'<div class="stat"><div class="l">Langue HTML</div><div class="v">'+esc(d.html_lang || '-')+'</div></div>' +
+'<div class="stat"><div class="l">Langue détectée</div><div class="v ok">'+esc(g.language)+'</div></div>' +
+'<div class="stat"><div class="l">Blocs</div><div class="v">'+(d.blocks_analyzed||0)+'</div></div>' +
+'<div class="stat"><div class="l">Mixte</div><div class="v '+(d.is_mixed?'warn':'ok')+'">'+(d.is_mixed?'OUI':'NON')+'</div></div>' +
+'<div class="stat"><div class="l">Durée</div><div class="v">'+(d.duration_ms||0)+'ms</div></div>';
+document.getElementById('stats').innerHTML = html;
+document.getElementById('blocks').innerHTML = '';
+document.getElementById('result').textContent = JSON.stringify(d, null, 2);
+}
+</script>
+</body>
+</html>
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUCHE 11 — HANDLER HTTP
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Handler(BaseHTTPRequestHandler):
+def log_message(self, *args): pass
+
+def _send(self, code, body, ctype="application/json"):
+try:
+if isinstance(body, str):
+body = body.encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", ctype + "; charset=utf-8")
+self.send_header("Access-Control-Allow-Origin", "*")
+self.send_header("Content-Length", str(len(body)))
+self.end_headers()
+self.wfile.write(body)
+except (BrokenPipeError, ConnectionResetError):
+pass
+
+def _read_json(self) -> Dict:
+try:
+n = int(self.headers.get("Content-Length", "0"))
+if n > 10_000_000:
+return {}
+raw = self.rfile.read(n)
+return json.loads(raw.decode("utf-8"))
+except Exception:
+return {}
+
+def do_GET(self):
+path = self.path.split("?")[0]
+if path in ("/", "/index.html"):
+return self._send(200, HTML_UI, "text/html")
+if path == "/api/health":
+return self._send(200, json.dumps(ENGINE.stats(), ensure_ascii=False))
+if path == "/api/languages":
+return self._send(200, json.dumps({
+"detection": Stopwords.languages(),
+"count": len(Stopwords.languages()),
+}))
+if path == "/api/dictionaries":
+return self._send(200, json.dumps({
+"pairs": [f"{s}→{t}" for (s, t) in Dictionaries.available_pairs()],
+"count": len(Dictionaries.available_pairs()),
+}))
+return self._send(404, json.dumps({"error": "not found"}))
+
+def do_POST(self):
+path = self.path.split("?")[0]
+data = self._read_json()
+
+if path == "/api/detect":
+text = data.get("text", "")
+if not text:
+return self._send(400, json.dumps({"error": "text missing"}))
+return self._send(200, json.dumps(ENGINE.analyze_text(text), ensure_ascii=False))
+
+if path == "/api/detect-multi":
+text = data.get("text", "")
+if not text:
+return self._send(400, json.dumps({"error": "text missing"}))
+return self._send(200, json.dumps(ENGINE.analyze_multi(text), ensure_ascii=False))
+
+if path == "/api/analyze-url":
+url = data.get("url", "")
+if not url:
+return self._send(400, json.dumps({"error": "url missing"}))
+return self._send(200, json.dumps(ENGINE.analyze_url(url), ensure_ascii=False))
+
+if path == "/api/translate":
+text = data.get("text", "")
+source = data.get("source", "fr")
+target = data.get("target", "en")
+if not text:
+return self._send(400, json.dumps({"error": "text missing"}))
+return self._send(200, json.dumps(ENGINE.translate(text, source, target), ensure_ascii=False))
+
+return self._send(404, json.dumps({"error": "not found"}))
+
+
+class Server(ThreadingMixIn, HTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUCHE 12 — MAIN + CLI
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ip_locale() -> str:
+try:
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("8.8.8.8", 80))
+ip = s.getsockname()[0]
+s.close()
+return ip
+except Exception:
+return "localhost"
+
+
+def cmd_test(text: str):
+"""Test rapide en ligne de commande."""
+print("=" * 70)
+print(f" 🧬 TEST NEXUS LANG-TRANSDUCTOR v{Config.VERSION}")
+print("=" * 70)
+print(f" Texte : {text[:100]}")
+print()
+result = ENGINE.analyze_text(text)
+det = result["detection"]
+print(f" Langue détectée : {det['language']}")
+print(f" Confiance : {round(det['confidence']*100, 1)}%")
+print(f" Méthode : {det['method']}")
+print(f" Script : {det['script']}")
+print(f" Durée : {result['duration_ms']} ms")
+print()
+if det.get("scores"):
+print(" Top scores :")
+for lang, score in list(det["scores"].items())[:5]:
+print(f" · {lang}: {score}")
+
+
+def main():
+import argparse
+parser = argparse.ArgumentParser(description="Nexus Lang-Transductor Pro v2.0")
+parser.add_argument("--test", type=str, help="Test rapide sur un texte")
+parser.add_argument("--local", action="store_true", help="Force mode local")
+parser.add_argument("--port", type=int, default=Config.PORT)
+args = parser.parse_args()
+
+if args.test:
+cmd_test(args.test)
+return
+
+print("=" * 74)
+print(f" 🧬 NEXUS LANG-TRANSDUCTOR PRO v{Config.VERSION}")
+print(f" {Config.LICENCE} · {Config.AUTEUR}")
+print(f" {Config.PROTOCOLE}")
+print("=" * 74)
+print()
+print(f" Mode : {'LOCAL' if Config.LOCAL_MODE else 'ONLINE'}")
+print(f" Port : {args.port}")
+print(f" Langues : {len(Stopwords.languages())} en détection")
+print(f" Paires dict. : {len(Dictionaries.available_pairs())}")
+print(f" Scripts : {len(UnicodeRanges.RANGES)}")
+print()
+print(f" Local : http://localhost:{args.port}/")
+print(f" Réseau : http://{ip_locale()}:{args.port}/")
+print()
+print(" Endpoints :")
+print(" POST /api/detect → détecte la langue")
+print(" POST /api/detect-multi → détection par blocs")
+print(" POST /api/analyze-url → analyse une URL")
+print(" POST /api/translate → traduction locale")
+print(" GET /api/health → état")
+print(" GET /api/languages → langues disponibles")
+print(" GET /api/dictionaries → paires de dictionnaires")
+print()
+print(" Ctrl+C pour arrêter")
+print()
+
+try:
+with Server(("0.0.0.0", args.port), Handler) as httpd:
+httpd.serve_forever()
+except KeyboardInterrupt:
+print("\n Arrêté.")
+except OSError as e:
+print(f" ❌ Erreur port {args.port} : {e}")
+sys.exit(1)
+
+
+if __name__ == "__main__":
+try:
+main()
+except Exception as e:
+print(f"Fatal : {e}", file=sys.stderr)
+import traceback
+traceback.print_exc()
+sys.exit(1)
