@@ -1,0 +1,90 @@
+NexusCinema/ ├── frames/ # Assets visuels : sprites, textures, séquences ├── scripts/ # Logique des thèmes : animation, réactions, transitions ├── state/ # État persistant : thème actif, préférences, progression ├── data/ # Ressources : palettes, configurations, métadonnées ├── logs/ # Journaux d'exécution (non versionnés) └── README.md
+
+| Dossier | Rôle | Versionné |
+|---------|------|-----------|
+| `frames/` | Assets graphiques des scènes | ✅ Oui |
+| `scripts/` | Code des thèmes | ✅ Oui |
+| `state/` | État runtime (change à chaque session) | ⚠️ Partiellement |
+| `data/` | Ressources statiques | ✅ Oui |
+| `logs/` | Sortie de débogage | ❌ Non |
+
+---
+
+## 🚀 Démarrage
+
+```bash
+git clone https://github.com/Aissamohammedi88/NexusCinema
+cd NexusCinema
+./scripts/start.sh
+
+Le moteur détecte automatiquement votre résolution, charge le thème par défaut depuis state/, et lance la boucle de rendu.
+🎨 Créer un thème
+
+Un thème vit dans scripts/ et déclare ses assets dans frames/.
+scripts/
+└── mon_theme/
+    ├── theme.json      # Manifeste : nom, auteur, résolution cible
+    ├── animate.*       # Boucle de rendu
+    └── react.*         # Réactions aux événements système
+
+Manifeste minimal (theme.json) :
+{
+  "name": "Aurore Boréale",
+  "author": "votre_nom",
+  "version": "1.0.0",
+  "fps_target": 30,
+  "assets": ["frames/aurore/*.png"],
+  "reacts_to": ["mouse", "cpu", "time"]
+}
+
+Événements disponibles :
+Événement	Fréquence	Usage typique
+mouse	Temps réel	Parallaxe, suivi de curseur
+cpu	1 Hz	Intensité, vitesse d'animation
+time	1/min	Palettes jour/nuit
+focus	À l'événement	Atténuation quand une app est active
+⚙️ Configuration
+
+Les préférences vivent dans state/preferences.json :
+{
+  "active_theme": "aurore",
+  "fps_cap": 30,
+  "pause_on_fullscreen": true,
+  "cpu_threshold_pause": 85
+}
+
+Points d'attention :
+
+    fps_cap : plafonner à 30 réduit fortement la consommation GPU
+    pause_on_fullscreen : coupe le rendu quand une vidéo ou un jeu occupe l'écran
+    cpu_threshold_pause : suspend l'animation au-delà du seuil (en %)
+
+📊 Compatibilité
+Système	Statut
+Linux (X11)	✅ Supporté
+Linux (Wayland)	⚠️ Limitations selon compositeur
+Windows 10/11	✅ Supporté
+macOS	⚠️ Support partiel
+🗺️ Feuille de route
+
+    v1.1 — Éditeur de thèmes visuel
+    v1.2 — Synchronisation avec l'heure système et la météo locale
+    v1.3 — Mode multi-écrans
+    v2.0 — Marketplace de thèmes communautaires
+
+🤝 Contribuer
+
+Les contributions sont bienvenues :
+
+    Thèmes — créez-en un, proposez-le en pull request
+    Optimisation — profilage GPU/CPU, réduction de la consommation
+    Portabilité — support Wayland et macOS
+    Documentation — traductions, tutoriels
+
+Consultez CONTRIBUTING.md avant de commencer.
+📄 Licence
+
+MPL 2.0 — utilisation, modification et redistribution libres. Attribution requise. Modifications documentées.
+👤 Auteur
+
+Aissa Mohammedi (DGK) @Aissamohammedi88
